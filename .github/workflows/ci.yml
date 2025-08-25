@@ -1,0 +1,160 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: courtroom_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        npm ci
+        npm run install:all
+    
+    - name: Lint frontend
+      run: |
+        cd apps/frontend
+        npm run lint
+    
+    - name: Type check frontend
+      run: |
+        cd apps/frontend
+        npm run type-check
+    
+    - name: Lint gateway
+      run: |
+        cd apps/gateway
+        npm run lint
+    
+    - name: Type check gateway
+      run: |
+        cd apps/gateway
+        npm run build
+    
+    - name: Lint orchestrator
+      run: |
+        cd apps/orchestrator
+        pip install flake8 black isort mypy
+        flake8 app/
+        black --check app/
+        isort --check-only app/
+        mypy app/
+    
+    - name: Lint workers
+      run: |
+        cd apps/workers
+        pip install flake8 black isort mypy
+        flake8 app/
+        black --check app/
+        isort --check-only app/
+        mypy app/
+    
+    - name: Run unit tests
+      run: |
+        cd apps/orchestrator
+        pip install pytest pytest-cov
+        pytest --cov=app --cov-report=xml
+        cd ../workers
+        pytest --cov=app --cov-report=xml
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./apps/*/coverage.xml
+
+  build:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Build and push Docker images
+      run: |
+        docker build -t courtroom-simulator/frontend:latest apps/frontend/
+        docker build -t courtroom-simulator/gateway:latest apps/gateway/
+        docker build -t courtroom-simulator/orchestrator:latest apps/orchestrator/
+        docker build -t courtroom-simulator/workers:latest apps/workers/
+        
+        docker push courtroom-simulator/frontend:latest
+        docker push courtroom-simulator/gateway:latest
+        docker push courtroom-simulator/orchestrator:latest
+        docker push courtroom-simulator/workers:latest
+
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+    
+    - name: Run dependency scan
+      run: |
+        npm audit --audit-level=moderate
+        cd apps/orchestrator && pip-audit
+        cd ../workers && pip-audit
